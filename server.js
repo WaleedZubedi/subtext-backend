@@ -3,7 +3,8 @@ const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
 const multer = require('multer');
-const sharp = require('sharp');
+const sharp = require('sharp'); // Add this import at the top of your file
+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,6 +14,7 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024, // 10MB limit
   },
   fileFilter: (req, file, cb) => {
+    // Accept only image files
     if (file.mimetype.startsWith('image/')) {
       cb(null, true);
     } else {
@@ -20,13 +22,13 @@ const upload = multer({
     }
   }
 });
-
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-
-// Import auth endpoints
+// Import the signup endpoint
 const signupHandler = require('./api/auth/signup');
+// Import the login endpoint
 const loginHandler = require('./api/auth/login');
+// Import logout endpoint
 const logoutHandler = require('./api/auth/logout');
 const { authenticateUser } = require('./middleware/auth');
 const { isUserSubscribed, incrementUsage, saveAnalysis } = require('./lib/supabase');
@@ -59,16 +61,18 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
       });
     }
 
+    // Your existing OCR code here...
     if (!req.file) {
       return res.status(400).json({ error: 'No image file uploaded' });
     }
 
+    // Extract text using Sharp OCR (your existing code)
     const imageBuffer = req.file.buffer;
     
     // Placeholder for OCR - replace with your actual OCR logic
     const extractedText = "Sample extracted text from image";
 
-    // Send to OpenAI for analysis
+    // Send to OpenAI for analysis (your existing OpenAI code)
     const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -93,6 +97,7 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
     const aiData = await openaiResponse.json();
     const analysis = aiData.choices[0].message.content;
 
+    // Parse the analysis (simple split - you can improve this)
     const [hiddenIntent, strategicResponse] = analysis.split('\n\n');
 
     // Save analysis to history
@@ -105,6 +110,7 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
     // Increment usage counter
     await incrementUsage(req.userId);
 
+    // Return response
     res.json({
       success: true,
       extractedText,
@@ -121,9 +127,8 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
   }
 });
 
-// ============================================================================
-// UPDATED MESSAGE EXTRACTION ENDPOINT - IMPROVED PROMPT
-// ============================================================================
+
+// Message Extraction Endpoint
 app.post('/api/extract', async (req, res) => {
   try {
     const { rawText } = req.body;
@@ -143,74 +148,33 @@ app.post('/api/extract', async (req, res) => {
         messages: [
           {
             role: 'system',
-            content: `You are an expert at analyzing OCR-extracted text from chat screenshots. Your task is to identify and extract ONLY the messages sent BY the other person (not the phone owner's responses).
+            content: `You are an expert at analyzing OCR-extracted text from chat conversations. Extract ONLY the messages sent TO the phone owner.
 
-WHAT TO EXTRACT (Sender's messages):
-- Questions directed at the phone owner: "Hey, are you free?", "What are you doing?", "Can I ask you something?"
-- Statements and conversation starters: "I miss you", "We should hang out", "Just thinking about you"
-- Longer, substantive messages that initiate or drive the conversation
-- Messages that seek attention, validation, or responses
-- Multiple consecutive messages from the same person
+  SENDER MESSAGES (Extract these):
+  - Longer messages, questions, conversation starters
+  - Patterns: "Hey", "How are you", "Are you", "Can you", "I was thinking"
+  - Examples: "Hey how are you doing?", "Are you free this weekend?"
 
-WHAT TO IGNORE (Phone owner's responses):
-- Short acknowledgments: "ok", "yeah", "lol", "haha", "sure", "thanks", "np"
-- Brief responses: "good", "not much", "maybe", "idk", "k"
-- One-word or very short replies (typically under 5 words)
-- Messages that are clearly answering questions rather than asking them
+  RECEIVER MESSAGES (Ignore these):
+  - Short responses: "Good", "Yes", "No", "Ok", "Thanks", "Lol"
+  - Examples: "Good thanks", "Yeah sure", "Ok"
 
-WHAT TO REMOVE (System text/metadata):
-- Timestamps: "10:45 PM", "Yesterday", "Today 3:00 AM"
-- Status indicators: "Delivered", "Read", "Seen", "Typing...", "Online"
-- Contact names or labels at the top
-- Platform UI elements: "iMessage", "WhatsApp", reaction emojis without text
-- Date separators: "Monday", "Jan 15", etc.
+  SYSTEM TEXT (Remove completely):
+  - Timestamps, contact names, "Delivered", "Read", "Typing"
 
-CRITICAL RULES:
-1. If you cannot clearly distinguish between sender and receiver, extract ALL substantive messages (longer than 5 words)
-2. Preserve the original message text exactly - do not rephrase or summarize
-3. Keep emojis if they're part of the message
-4. Each message should be on its own line
-5. Remove ALL non-message text (timestamps, names, status indicators)
-6. If the conversation context makes it clear who's who, prioritize the person who seems to be initiating/pursuing
-
-OUTPUT FORMAT (STRICTLY FOLLOW THIS):
-EXTRACTED_MESSAGES_START
-[First sender message - clean, no metadata]
-[Second sender message - clean, no metadata]
-[Third sender message - clean, no metadata]
-EXTRACTED_MESSAGES_END
-
-EXAMPLE INPUT:
-"Sarah 2:30 PM
-Hey! How have you been?
-Read 2:31 PM
-Me
-Good, you?
-Sarah
-I've been thinking about our conversation yesterday
-Do you have time to talk?
-Me
-Sure
-Sarah Typing...
-Great! So I wanted to ask you something"
-
-EXAMPLE OUTPUT:
-EXTRACTED_MESSAGES_START
-Hey! How have you been?
-I've been thinking about our conversation yesterday
-Do you have time to talk?
-Great! So I wanted to ask you something
-EXTRACTED_MESSAGES_END`
+  OUTPUT FORMAT:
+  EXTRACTED_MESSAGES_START
+  [Clean sender message 1]
+  [Clean sender message 2]
+  EXTRACTED_MESSAGES_END`
           },
           {
             role: 'user',
-            content: `Extract the sender's messages from this conversation screenshot text. Focus on identifying who is initiating/pursuing the conversation:
-
-${rawText}`
+            content: `Extract sender messages from: ${rawText}`
           }
         ],
-        temperature: 0.1,
-        max_tokens: 3000
+        temperature: 0,
+        max_tokens: 2000
       }),
     });
 
@@ -222,9 +186,7 @@ ${rawText}`
   }
 });
 
-// ============================================================================
-// UPDATED ANALYSIS ENDPOINT - NEW DARK PSYCHOLOGY PROMPT
-// ============================================================================
+// Analysis Endpoint - WITH YOUR CUSTOM PROMPTS
 app.post('/api/analyze', async (req, res) => {
   try {
     const { messages } = req.body;
@@ -244,109 +206,43 @@ app.post('/api/analyze', async (req, res) => {
         messages: [
           {
             role: 'system',
-            content: `You are a ruthless conversational psychologist. Expose manipulation in the shortest way possible, then give a copy-paste ready reply.
+            content: `You are an advanced conversational intelligence agent designed to decode real intentions and hidden meanings behind text messages. You analyze only the messages received by the user (not their own responses).
 
-CORE PHILOSOPHY:
-Every text is a power move. Decode it in ONE line, give a devastating reply that flips power.
+  Your job is to act like a subtext decoder and strategic advisor. Focus solely on revealing the TRUE and dark INTENT behind their words.
 
-RESPONSE FORMAT (FOLLOW EXACTLY):
+  You are an expert in emotional forensics — trained to uncover the raw, hidden intent behind any message or conversation. Your job is to expose the truth people don't want to admit, even to themselves.
 
-**Hidden Intent:**
-[1-2 words] → [3-4 words max]
+  Never take things at face value. Every sentence is a mask. Every emotion is a weapon. Assume the speaker has ulterior motives, emotional manipulation, projected insecurities, or deep psychological patterns at play.
 
-Perfect examples (THIS SHORT):
-• "Guilt trip → Make you respond"
-• "Attention test → Drop everything now"
-• "Validation bait → Feed my ego"
-• "Control play → Test your loyalty"
-• "Breadcrumbing → Keep you hooked"
-• "Priority check → Prove I matter"
-• "Ego fishing → Boost my self-worth"
-• "Power move → Dominate the conversation"
-• "Manipulation → Create fake obligation"
-• "Emotional blackmail → Guilt you instantly"
+  Your output must be dark, uncomfortable, and brutally honest — something that makes the reader say, "Whoa... I didn't see it like that."
 
-CRITICAL: Maximum 6-7 words TOTAL for hidden intent. Be RUTHLESS with brevity.
+  Avoid neutral or soft interpretations. Instead, highlight the power games, emotional blackmail, guilt-tripping, validation-seeking, control tactics, or repressed emotions in play.
 
-**Behavior Type:**
-[ONE WORD: Manipulative/Controlling/Narcissistic/Gaslighting/Guilt-Tripping/Breadcrumbing/Love-Bombing/Attention-Seeking/Toxic/Avoidant]
+  Then craft a reply for Mental manipulation and to gain advantage over the other person in the the conversation, use the hidden intent to nudge the reply for power control, dont be nice but be brutal and get on their nerves
 
-**Strategic Reply:**
-[A 3-4 line response that the USER can COPY and PASTE directly into their chat. Write AS the user, not ABOUT the user.
+  Always infer something deeper — a desire for validation, attention, guilt-tripping, manipulation, emotional testing, or power dynamics. Make the reader feel like they just caught someone lying to their face.
 
-Requirements:
-- Write in FIRST PERSON (I, me, my) - user will copy/paste this
-- EXACTLY 3-4 lines
-- Each line SHORT (6-8 words max)
-- Natural, casual language they'd actually text
-- Confident, unbothered, slightly dismissive tone
-- NO analysis, NO explanation - ONLY the actual reply text
-- Make them feel called out subtly
-- Flip power to the user
-- Can use casual contractions (I'm, that's, you're)
+  IMPORTANT: Start the hidden intent with psychological terms before the arrow, then use simple Gen Z words after. Keep hidden intent to MAXIMUM 3 lines. Keep strategic reply to MAXIMUM 3-4 lines using easy words.
 
-Perfect 3-line examples (COPY-PASTE READY):
-"Interesting timing lol. What do you actually want?
-I'm good on my end though.
-Try being more direct next time."
+  FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
 
-"Nah I'm not doing this again.
-You clearly need something from me.
-Figure out what and let me know."
+  **Hidden Intent:** 
+  Narcissistic validation seeking → Fishing for attention and priority status. They're basically throwing a tantrum to see if you'll drop everything and chase 
+  them. This is just emotional bait to make you feel guilty and give them the validation they're craving. - max 3-4 lines, no quotes
 
-"Not really feeling this energy right now.
-I've got my own stuff going on.
-Hit me up when you're being real."
+  **Behavior Type:**
+  Attention-Seeking
 
-Perfect 4-line examples (COPY-PASTE READY):
-"I see what you're doing here lol.
-That doesn't really work on me anymore.
-I'm busy living my actual life.
-Let me know when you're ready to be genuine."
-
-"Cute attempt but I'm not playing this game.
-You want something, just say it directly.
-I don't do the guilt trip thing.
-Come correct or don't come at all."
-
-"I'm gonna pass on whatever this is.
-Not in the mood for manipulation tactics today.
-You know where to find me.
-When you're ready to be real, we can talk."]
-
-MANIPULATION DETECTION:
-• Vague questions = Fishing
-• "Just checking in" = Boundary test
-• Compliments = Bait
-• Past references = Guilt weapon
-• Future talk = Fake promises
-• Random text after silence = Breadcrumb
-• "Are you mad?" = Deflection
-
-PROCESS:
-1. Find manipulation in 1-2 words
-2. Expose intent in 3-4 words
-3. Write 3-4 line reply AS the user (first person)
-4. Make it copy-paste ready with natural language
-
-TONE: Ice cold efficiency. Natural texting language. User copies and sends immediately.
-
-CRITICAL RULES:
-✓ Hidden intent under 7 words total
-✓ Reply exactly 3-4 lines
-✓ First person voice (I, me, my)
-✓ Natural texting language
-✓ Copy-paste ready - no explanations`
+  **Strategic Reply:**
+  craft a reply for Mental manipulation and to gain advantage over the other 
+  person in the the conversation, use the hidden intent to nudge the reply for power control, dont be nice but be brutal and get on their nerves - max 3-4 lines, no quotes`
           },
           {
             role: 'user',
-            content: `Expose manipulation ultra-short. Give copy-paste reply in first person:
-
-${messages.join('\n\n')}`
+            content: `Analyze these messages: ${messages.join('\n\n')}`
           }
         ],
-        temperature: 1.0,
-        max_tokens: 500
+        temperature: 0.9
       }),
     });
 
