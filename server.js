@@ -66,11 +66,50 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
       return res.status(400).json({ error: 'No image file uploaded' });
     }
 
-    // Extract text using Sharp OCR (your existing code)
-    const imageBuffer = req.file.buffer;
-    
-    // Placeholder for OCR - replace with your actual OCR logic
-    const extractedText = "Sample extracted text from image";
+  // Convert image to base64 for OpenAI Vision
+const imageBuffer = req.file.buffer;
+const base64Image = imageBuffer.toString('base64');
+const mimeType = req.file.mimetype || 'image/jpeg';
+
+// Use OpenAI Vision to extract text
+const visionResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+    'Content-Type': 'application/json'
+  },
+  body: JSON.stringify({
+    model: 'gpt-4o',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'Extract ALL text from this image. Return only the text content, nothing else.'
+          },
+          {
+            type: 'image_url',
+            image_url: {
+              url: `data:${mimeType};base64,${base64Image}`
+            }
+          }
+        ]
+      }
+    ],
+    max_tokens: 1000
+  })
+});
+
+const visionData = await visionResponse.json();
+const extractedText = visionData.choices[0].message.content.trim();
+
+if (!extractedText || extractedText.length < 5) {
+  return res.status(400).json({ 
+    error: 'No text found in image',
+    message: 'Please upload an image with readable text'
+  });
+}
 
     // Send to OpenAI for analysis (your existing OpenAI code)
     const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
