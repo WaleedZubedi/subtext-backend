@@ -30,17 +30,11 @@ const signupHandler = require('./api/auth/signup');
 const loginHandler = require('./api/auth/login');
 const logoutHandler = require('./api/auth/logout');
 const { authenticateUser } = require('./middleware/auth');
-const { isUserSubscribed, incrementUsage, saveAnalysis } = require('./lib/supabase');
+const { isUserSubscribed, incrementUsage, saveAnalysis, getUserSubscription } = require('./lib/supabase');
 
 // ============================================
 // HEALTH CHECK ENDPOINTS
 // ============================================
-// Add this right after your imports
-app.use((req, res, next) => {
-  console.log(`📨 ${req.method} ${req.path}`);
-  console.log('Headers:', req.headers.authorization ? 'Token present' : 'No token');
-  next();
-});
 
 app.get('/', (req, res) => {
   res.json({ status: 'SubText API is running!' });
@@ -59,6 +53,41 @@ app.post('/api/auth/login', loginHandler);
 app.post('/api/auth/logout', logoutHandler);
 
 // ============================================
+// SUBSCRIPTION STATUS ENDPOINT
+// ============================================
+
+app.get('/api/subscription/status', authenticateUser, async (req, res) => {
+  try {
+    const subscription = await getUserSubscription(req.userId);
+    
+    // If no subscription found, return false
+    if (!subscription) {
+      return res.json({
+        hasSubscription: false,
+        subscription: null
+      });
+    }
+    
+    // Check if subscription is active and not expired
+    const isActive = subscription.status === 'active';
+    const notExpired = new Date(subscription.expires_at) > new Date();
+    const hasSubscription = isActive && notExpired;
+    
+    res.json({
+      hasSubscription,
+      subscription: subscription
+    });
+  } catch (error) {
+    console.error('Subscription status error:', error);
+    // Return false on error instead of 500
+    res.json({
+      hasSubscription: false,
+      subscription: null
+    });
+  }
+});
+
+// ============================================
 // OCR ENDPOINT - Image Upload & Text Extraction
 // ============================================
 
@@ -67,19 +96,18 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
     console.log('=== OCR REQUEST START ===');
     console.log('User ID:', req.userId);
 
-     const hasSubscription = await isUserSubscribed(req.userId);
+    // Check if user has active subscription
+    const hasSubscription = await isUserSubscribed(req.userId);
     if (!hasSubscription) {
       return res.status(403).json({ 
         error: 'Subscription required',
         message: 'Please subscribe to use this feature'
       });
-    ß}
+    }
 
     if (!req.file) {
       return res.status(400).json({ error: 'No image file uploaded' });
     }
-
-    // ... rest of the code stays the same
 
     // Convert image to base64 for OpenAI Vision
     const imageBuffer = req.file.buffer;
@@ -101,7 +129,8 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
             content: [
               {
                 type: 'text',
-                text: 'Extract ALL text from this image. Return only the text content, nothing else. If you cannot find any text, say "No readable text found".'              },
+                text: 'Extract ALL text from this image. Return only the text content, nothing else. If you cannot find any text, say "No readable text found".'
+              },
               {
                 type: 'image_url',
                 image_url: {
@@ -127,17 +156,16 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
     const extractedText = visionData.choices[0].message.content.trim();
 
     console.log('=== OPENAI VISION RESPONSE ===');
+    console.log('Full response:', JSON.stringify(visionData, null, 2));
     console.log('Extracted text:', extractedText);
+    console.log('Text length:', extractedText.length);
     console.log('==============================');
     
-    // Check if no text was found
-    if (!extractedText || 
-        extractedText.length < 3 || 
-        extractedText.toLowerCase().includes('no readable text') ||
-        extractedText.toLowerCase().includes('no text found')) {
+    // Validation
+    if (!extractedText || extractedText.length < 3) {
       return res.status(400).json({ 
-        error: 'No text detected',
-        message: 'Could not find any text in this image. Please upload a screenshot with text messages.'
+        error: 'Could not read image',
+        message: 'Please try a clearer image'
       });
     }
     console.log('✅ Text extracted successfully:', extractedText.substring(0, 100) + '...');
@@ -176,7 +204,7 @@ app.post('/api/extract', async (req, res) => {
       return res.status(400).json({ error: 'No text provided' });
     }
 
-    console.log('📝 Extracting messages from text...');
+    console.log('🔍 Extracting messages from text...');
 
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -283,7 +311,7 @@ Attention-Seeking
 **Strategic Reply:**
 Depends what you're offering. I've got options tonight.
 
-─────────────────
+────────────────
 
 Message: "Just checking in on you 😊"
 **Hidden Intent:**
@@ -295,7 +323,7 @@ Controlling
 **Strategic Reply:**
 I'm good. Been busy actually. What's up?
 
-─────────────────
+────────────────
 
 Message: "We should catch up soon!"
 **Hidden Intent:**
@@ -307,7 +335,7 @@ Manipulative
 **Strategic Reply:**
 Sure, let me know when you've got specific plans.
 
-─────────────────
+────────────────
 
 FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
 
@@ -350,6 +378,6 @@ if (process.env.NODE_ENV === 'production') {
   // For local development
   app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📍 Local: http://localhost:${PORT}`);
+    console.log(`🔍 Local: http://localhost:${PORT}`);
   });
 }
