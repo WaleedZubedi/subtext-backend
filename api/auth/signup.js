@@ -1,5 +1,6 @@
 const bcrypt = require('bcryptjs');
 const { supabaseAdmin, getUserByEmail } = require('../../lib/supabase');
+const { createClient: createSupabaseClient } = require('@supabase/supabase-js');
 
 module.exports = async (req, res) => {
   // Only allow POST requests
@@ -12,8 +13,8 @@ module.exports = async (req, res) => {
 
     // Validate input
     if (!email || !password || !fullName) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: email, password, fullName' 
+      return res.status(400).json({
+        error: 'Missing required fields: email, password, fullName'
       });
     }
 
@@ -25,8 +26,8 @@ module.exports = async (req, res) => {
 
     // Validate password strength (minimum 6 characters)
     if (password.length < 6) {
-      return res.status(400).json({ 
-        error: 'Password must be at least 6 characters long' 
+      return res.status(400).json({
+        error: 'Password must be at least 6 characters long'
       });
     }
 
@@ -58,21 +59,43 @@ module.exports = async (req, res) => {
 
     if (userError) throw userError;
 
-    // Return success
+    // NO AUTO-SUBSCRIPTION - Users must pay to use the app
+    // For testing: manually add subscriptions in Supabase
+
+    // Create a regular supabase client to sign in (not admin)
+    const supabase = createSupabaseClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_ANON_KEY  // Use anon key, not service key
+    );
+
+    // Sign in the user immediately to get a token
+    const { data: signInData, error: signInError } = await supabase.auth.signInWithPassword({
+      email,
+      password
+    });
+
+    if (signInError) throw signInError;
+
+    // Return success with token (same format as login)
     return res.status(201).json({
       message: 'User created successfully',
       user: {
         id: user.id,
         email: user.email,
         fullName: user.full_name
+      },
+      session: {
+        accessToken: signInData.session.access_token,
+        refreshToken: signInData.session.refresh_token,
+        expiresAt: signInData.session.expires_at
       }
     });
 
   } catch (error) {
     console.error('Signup error:', error);
-    return res.status(500).json({ 
+    return res.status(500).json({
       error: 'Failed to create user',
-      details: error.message 
+      details: error.message
     });
   }
 };

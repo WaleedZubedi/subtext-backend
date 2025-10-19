@@ -35,6 +35,12 @@ const { isUserSubscribed, incrementUsage, saveAnalysis } = require('./lib/supaba
 // ============================================
 // HEALTH CHECK ENDPOINTS
 // ============================================
+// Add this right after your imports
+app.use((req, res, next) => {
+  console.log(`📨 ${req.method} ${req.path}`);
+  console.log('Headers:', req.headers.authorization ? 'Token present' : 'No token');
+  next();
+});
 
 app.get('/', (req, res) => {
   res.json({ status: 'SubText API is running!' });
@@ -59,20 +65,21 @@ app.post('/api/auth/logout', logoutHandler);
 app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) => {
   try {
     console.log('=== OCR REQUEST START ===');
+    console.log('User ID:', req.userId);
 
-    // Check if user has active subscription
-    const hasSubscription = await isUserSubscribed(req.userId);
-    
+     const hasSubscription = await isUserSubscribed(req.userId);
     if (!hasSubscription) {
       return res.status(403).json({ 
         error: 'Subscription required',
         message: 'Please subscribe to use this feature'
       });
-    }
+    ß}
 
     if (!req.file) {
       return res.status(400).json({ error: 'No image file uploaded' });
     }
+
+    // ... rest of the code stays the same
 
     // Convert image to base64 for OpenAI Vision
     const imageBuffer = req.file.buffer;
@@ -94,8 +101,7 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
             content: [
               {
                 type: 'text',
-                text: 'Extract ALL text from this image. Return only the text content, nothing else.'
-              },
+                text: 'Extract ALL text from this image. Return only the text content, nothing else. If you cannot find any text, say "No readable text found".'              },
               {
                 type: 'image_url',
                 image_url: {
@@ -120,13 +126,20 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
 
     const extractedText = visionData.choices[0].message.content.trim();
 
-    if (!extractedText || extractedText.length < 5) {
+    console.log('=== OPENAI VISION RESPONSE ===');
+    console.log('Extracted text:', extractedText);
+    console.log('==============================');
+    
+    // Check if no text was found
+    if (!extractedText || 
+        extractedText.length < 3 || 
+        extractedText.toLowerCase().includes('no readable text') ||
+        extractedText.toLowerCase().includes('no text found')) {
       return res.status(400).json({ 
-        error: 'No text found in image',
-        message: 'Please upload an image with readable text'
+        error: 'No text detected',
+        message: 'Could not find any text in this image. Please upload a screenshot with text messages.'
       });
     }
-
     console.log('✅ Text extracted successfully:', extractedText.substring(0, 100) + '...');
 
     // Increment usage counter (async, don't wait for response)
@@ -218,7 +231,7 @@ EXTRACTED_MESSAGES_END`
 
 // ============================================
 // ANALYSIS ENDPOINT - Psychological Analysis
-// Uses your brutal, honest prompts
+// NEW FORMAT: Short intent + First-person reply
 // ============================================
 
 app.post('/api/analyze', async (req, res) => {
@@ -242,34 +255,70 @@ app.post('/api/analyze', async (req, res) => {
         messages: [
           {
             role: 'system',
-            content: `You are an advanced conversational intelligence agent designed to decode real intentions and hidden meanings behind text messages. You analyze only the messages received by the user (not their own responses).
+            content: `You are a brutal psychological analyst decoding text conversations.
 
-Your job is to act like a subtext decoder and strategic advisor. Focus solely on revealing the TRUE and dark INTENT behind their words.
+Analyze ONLY the messages the user RECEIVED (not their own messages).
 
-You are an expert in emotional forensics — trained to uncover the raw, hidden intent behind any message or conversation. Your job is to expose the truth people don't want to admit, even to themselves.
+Your job:
+1. Identify the REAL hidden intent using psychological terms
+2. Provide a SHORT insightful summary (MAX 7 WORDS)
+3. Create a FIRST-PERSON reply the user can copy and send directly
 
-Never take things at face value. Every sentence is a mask. Every emotion is a weapon. Assume the speaker has ulterior motives, emotional manipulation, projected insecurities, or deep psychological patterns at play.
+CRITICAL RULES:
+- Hidden intent format: "psychological term → max 7 word summary"
+- Strategic reply MUST be first-person ("I" statements), ready to paste and send
+- Reply should manipulate, gain power, and get on their nerves
+- Reply must sound natural, like the user wrote it themselves
+- NO third-person advice, NO explanations, just the actual message to send
 
-Your output must be dark, uncomfortable, and brutally honest — something that makes the reader say, "Whoa... I didn't see it like that."
+Examples:
 
-Avoid neutral or soft interpretations. Instead, highlight the power games, emotional blackmail, guilt-tripping, validation-seeking, control tactics, or repressed emotions in play.
-
-Then craft a reply for Mental manipulation and to gain advantage over the other person in the conversation, use the hidden intent to nudge the reply for power control, dont be nice but be brutal and get on their nerves.
-
-Always infer something deeper — a desire for validation, attention, guilt-tripping, manipulation, emotional testing, or power dynamics. Make the reader feel like they just caught someone lying to their face.
-
-IMPORTANT: Start the hidden intent with psychological terms before the arrow, then use simple Gen Z words after. Keep hidden intent to MAXIMUM 3 lines. Keep strategic reply to MAXIMUM 3-4 lines using easy words.
-
-FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
-
+Message: "Hey are you free tonight?"
 **Hidden Intent:** 
-Narcissistic validation seeking → Fishing for attention and priority status. They're basically throwing a tantrum to see if you'll drop everything and chase them. This is just emotional bait to make you feel guilty and give them the validation they're craving. - max 3-4 lines, no quotes
+Availability testing → Fishing for your attention and priority
 
 **Behavior Type:**
 Attention-Seeking
 
 **Strategic Reply:**
-craft a reply for Mental manipulation and to gain advantage over the other person in the conversation, use the hidden intent to nudge the reply for power control, dont be nice but be brutal and get on their nerves - max 3-4 lines, no quotes`
+Depends what you're offering. I've got options tonight.
+
+─────────────────
+
+Message: "Just checking in on you 😊"
+**Hidden Intent:**
+Control disguised as care → Monitoring your availability
+
+**Behavior Type:**
+Controlling
+
+**Strategic Reply:**
+I'm good. Been busy actually. What's up?
+
+─────────────────
+
+Message: "We should catch up soon!"
+**Hidden Intent:**
+Vague obligation creation → Building social debt without commitment
+
+**Behavior Type:**
+Manipulative  
+
+**Strategic Reply:**
+Sure, let me know when you've got specific plans.
+
+─────────────────
+
+FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
+
+**Hidden Intent:** 
+[Psychological term] → [max 7 word insightful summary]
+
+**Behavior Type:**
+[One-word category]
+
+**Strategic Reply:**
+[First-person message ready to copy and send. Must sound natural and conversational. Use "I" statements. This is what the USER will send, not advice about what to send.]`
           },
           {
             role: 'user',

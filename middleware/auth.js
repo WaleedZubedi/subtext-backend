@@ -14,16 +14,17 @@ async function authenticateUser(req, res, next) {
 
     const token = authHeader.split(' ')[1];
 
-    // Verify token with Supabase
-    const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
+    // Verify token with Supabase - FIXED METHOD
+    const { data, error } = await supabaseAdmin.auth.getUser(token);
 
-    if (error || !user) {
+    if (error || !data?.user) {
+      console.error('Auth error:', error);
       return res.status(401).json({ error: 'Invalid or expired token' });
     }
 
     // Attach user to request object
-    req.user = user;
-    req.userId = user.id;
+    req.user = data.user;
+    req.userId = data.user.id;
 
     // Continue to next middleware/route
     next();
