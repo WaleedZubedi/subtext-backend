@@ -30,18 +30,67 @@ const signupHandler = require('./api/auth/signup');
 const loginHandler = require('./api/auth/login');
 const logoutHandler = require('./api/auth/logout');
 const { authenticateUser } = require('./middleware/auth');
-const { isUserSubscribed, incrementUsage, saveAnalysis, getUserSubscription } = require('./lib/supabase');
+const { isUserSubscribed, incrementUsage, saveAnalysis, getUserSubscription, hasReachedUsageLimit, getUserUsage } = require('./lib/supabase');
+
+// Import subscription handlers
+const getPlansHandler = require('./api/subscriptions/plans');
+const createSubscriptionHandler = require('./api/subscriptions/create');
+const cancelSubscriptionHandler = require('./api/subscriptions/cancel');
+const paypalWebhookHandler = require('./api/webhooks/paypal');
+
+// In-memory cache for analysis results (simple implementation)
+const analysisCache = new Map();
+const CACHE_TTL = 3600000; // 1 hour
+
+// Rate limiting map (userId -> array of timestamps)
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW = 3600000; // 1 hour
+const RATE_LIMIT_MAX = 20; // 20 requests per hour
+
+// Helper: Check rate limit
+function checkRateLimit(userId) {
+  const now = Date.now();
+  const userRequests = rateLimitMap.get(userId) || [];
+  
+  // Remove old requests outside the window
+  const recentRequests = userRequests.filter(timestamp => now - timestamp < RATE_LIMIT_WINDOW);
+  
+  if (recentRequests.length >= RATE_LIMIT_MAX) {
+    return false; // Rate limit exceeded
+  }
+  
+  // Add current request
+  recentRequests.push(now);
+  rateLimitMap.set(userId, recentRequests);
+  
+  return true; // Within rate limit
+}
+
+// Helper: Generate cache key from image buffer
+function generateCacheKey(buffer, userId) {
+  const crypto = require('crypto');
+  const hash = crypto.createHash('md5').update(buffer).digest('hex');
+  return `${userId}_${hash}`;
+}
 
 // ============================================
 // HEALTH CHECK ENDPOINTS
 // ============================================
 
 app.get('/', (req, res) => {
-  res.json({ status: 'SubText API is running!' });
+  res.json({ 
+    status: 'SubText API is running!',
+    version: '1.0.0',
+    timestamp: new Date().toISOString()
+  });
 });
 
 app.get('/api', (req, res) => {
-  res.json({ status: 'SubText API is running!' });
+  res.json({ 
+    status: 'SubText API is running!',
+    version: '1.0.0',
+    timestamp: new Date().toISOString()
+  });
 });
 
 // ============================================
@@ -53,36 +102,76 @@ app.post('/api/auth/login', loginHandler);
 app.post('/api/auth/logout', logoutHandler);
 
 // ============================================
+// SUBSCRIPTION MANAGEMENT ENDPOINTS
+// ============================================
+
+// Get available subscription plans
+app.get('/api/subscriptions/plans', getPlansHandler);
+
+// Create subscription after PayPal payment
+app.post('/api/subscriptions/create', createSubscriptionHandler);
+
+// Cancel subscription
+app.post('/api/subscriptions/cancel', cancelSubscriptionHandler);
+
+// PayPal webhook for subscription events
+app.post('/api/webhooks/paypal', express.json({ verify: (req, res, buf) => { req.rawBody = buf.toString(); }}), paypalWebhookHandler);
+
+// ============================================
 // SUBSCRIPTION STATUS ENDPOINT
 // ============================================
 
 app.get('/api/subscription/status', authenticateUser, async (req, res) => {
   try {
     const subscription = await getUserSubscription(req.userId);
-    
-    // If no subscription found, return false
+    const usage = await getUserUsage(req.userId);
+
     if (!subscription) {
       return res.json({
         hasSubscription: false,
-        subscription: null
+        subscription: null,
+        usage: {
+          current: usage.analyses_count,
+          limit: 0,
+          remaining: 0
+        }
       });
     }
-    
+
     // Check if subscription is active and not expired
     const isActive = subscription.status === 'active';
     const notExpired = new Date(subscription.expires_at) > new Date();
     const hasSubscription = isActive && notExpired;
-    
+
+    // Calculate usage stats
+    const limit = subscription.monthly_limit === -1 ? 'unlimited' : subscription.monthly_limit;
+    const remaining = subscription.monthly_limit === -1
+      ? 'unlimited'
+      : Math.max(0, subscription.monthly_limit - usage.analyses_count);
+
     res.json({
       hasSubscription,
-      subscription: subscription
+      subscription: hasSubscription ? {
+        tier: subscription.tier,
+        expiresAt: subscription.expires_at,
+        monthlyLimit: subscription.monthly_limit
+      } : null,
+      usage: {
+        current: usage.analyses_count,
+        limit,
+        remaining
+      }
     });
   } catch (error) {
     console.error('Subscription status error:', error);
-    // Return false on error instead of 500
     res.json({
       hasSubscription: false,
-      subscription: null
+      subscription: null,
+      usage: {
+        current: 0,
+        limit: 0,
+        remaining: 0
+      }
     });
   }
 });
@@ -96,25 +185,68 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
     console.log('=== OCR REQUEST START ===');
     console.log('User ID:', req.userId);
 
+    // Rate limiting check
+    if (!checkRateLimit(req.userId)) {
+      return res.status(429).json({ 
+        error: 'Rate limit exceeded',
+        message: 'You are making too many requests. Please wait a few minutes and try again.'
+      });
+    }
+
     // Check if user has active subscription
     const hasSubscription = await isUserSubscribed(req.userId);
     if (!hasSubscription) {
-      return res.status(403).json({ 
+      return res.status(403).json({
         error: 'Subscription required',
         message: 'Please subscribe to use this feature'
       });
     }
 
+    // Check if user has reached usage limit
+    const limitReached = await hasReachedUsageLimit(req.userId);
+    if (limitReached) {
+      const subscription = await getUserSubscription(req.userId);
+      const usage = await getUserUsage(req.userId);
+
+      return res.status(403).json({
+        error: 'Usage limit reached',
+        message: `You've used ${usage.analyses_count} of your ${subscription.monthly_limit} monthly analyses. Please upgrade your plan for more.`,
+        usage: {
+          current: usage.analyses_count,
+          limit: subscription.monthly_limit
+        }
+      });
+    }
+
     if (!req.file) {
-      return res.status(400).json({ error: 'No image file uploaded' });
+      return res.status(400).json({ 
+        error: 'No image provided',
+        message: 'Please upload an image'
+      });
+    }
+
+    // Check cache
+    const imageBuffer = req.file.buffer;
+    const cacheKey = generateCacheKey(imageBuffer, req.userId);
+    const cachedResult = analysisCache.get(cacheKey);
+    
+    if (cachedResult && (Date.now() - cachedResult.timestamp < CACHE_TTL)) {
+      console.log('✅ Returning cached result');
+      return res.json({
+        ParsedResults: [{
+          ParsedText: cachedResult.text
+        }],
+        cached: true
+      });
     }
 
     // Convert image to base64 for OpenAI Vision
-    const imageBuffer = req.file.buffer;
     const base64Image = imageBuffer.toString('base64');
     const mimeType = req.file.mimetype || 'image/jpeg';
 
-    // Use OpenAI Vision API to extract text from image
+    console.log('📤 Sending to OpenAI Vision API...');
+
+    // Use OpenAI Vision API to extract LEFT-SIDE messages only
     const visionResponse = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -129,7 +261,47 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
             content: [
               {
                 type: 'text',
-                text: 'Extract ALL text from this image. Return only the text content, nothing else. If you cannot find any text, say "No readable text found".'
+                text: `You are analyzing a screenshot from ANY messaging app (iMessage, WhatsApp, Instagram, Snapchat, Facebook, etc.).
+
+YOUR TASK: Extract ONLY the messages that the phone owner RECEIVED (not the ones they sent).
+
+UNIVERSAL IDENTIFICATION RULES:
+
+1. **VISUAL POSITION**:
+   - Messages on the LEFT side = RECEIVED (extract these) ✅
+   - Messages on the RIGHT side = SENT by user (ignore these) ❌
+
+2. **BUBBLE ALIGNMENT**:
+   - Left-aligned bubbles = RECEIVED ✅
+   - Right-aligned bubbles = SENT ❌
+
+3. **COLOR PATTERNS** (varies by app):
+   - iMessage: Gray = received, Blue = sent
+   - WhatsApp: White/Light gray = received, Green = sent
+   - Instagram: Purple/Gray = received, Purple gradient = sent
+   - Facebook: Gray = received, Blue = sent
+   - Snapchat: Red = received, Blue = sent
+   - Generic rule: Lighter/neutral colors = usually received
+
+4. **MESSAGE CONTENT CLUES**:
+   - Questions/requests directed AT someone = RECEIVED ✅
+   - Responses/answers = SENT ❌
+
+CRITICAL INSTRUCTIONS:
+- Focus on POSITION (left vs right) as the PRIMARY indicator
+- Use color as a SECONDARY indicator
+- Only extract complete messages
+- Ignore timestamps, "Delivered", "Read", names, status indicators
+- If this is NOT a conversation screenshot, return: "ERROR: This image does not contain text messages"
+
+OUTPUT FORMAT:
+RECEIVED_MESSAGES_START
+[Message 1 that user received]
+[Message 2 that user received]
+RECEIVED_MESSAGES_END
+
+If you cannot identify text messages, return:
+ERROR: This image does not contain text messages`
               },
               {
                 type: 'image_url',
@@ -140,42 +312,100 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
             ]
           }
         ],
-        max_tokens: 1000
+        max_tokens: 1500,
+        temperature: 0.1
       })
     });
 
+    if (!visionResponse.ok) {
+      const errorData = await visionResponse.json();
+      console.error('OpenAI API error:', errorData);
+      return res.status(500).json({ 
+        error: 'Vision API failed',
+        message: 'Failed to process image. Please try again.'
+      });
+    }
+
     const visionData = await visionResponse.json();
-    
+
     if (!visionData.choices?.[0]?.message?.content) {
       return res.status(500).json({ 
-        error: 'Failed to extract text from image',
-        message: 'OpenAI Vision API returned no content'
+        error: 'No response from Vision API',
+        message: 'Failed to extract text from image. Please try again.'
       });
     }
 
-    const extractedText = visionData.choices[0].message.content.trim();
+    const responseContent = visionData.choices[0].message.content.trim();
+    console.log('=== VISION RESPONSE ===');
+    console.log(responseContent);
+    console.log('=======================');
 
-    console.log('=== OPENAI VISION RESPONSE ===');
-    console.log('Full response:', JSON.stringify(visionData, null, 2));
-    console.log('Extracted text:', extractedText);
-    console.log('Text length:', extractedText.length);
-    console.log('==============================');
-    
-    // Validation
-    if (!extractedText || extractedText.length < 3) {
+    // Check if image doesn't contain messages
+    if (responseContent.includes('ERROR:') || 
+        responseContent.toLowerCase().includes('does not contain text messages') ||
+        responseContent.toLowerCase().includes('not a conversation')) {
       return res.status(400).json({ 
-        error: 'Could not read image',
-        message: 'Please try a clearer image'
+        error: 'Invalid image',
+        message: 'This image does not appear to contain text messages. Please upload a screenshot of a conversation.'
       });
     }
-    console.log('✅ Text extracted successfully:', extractedText.substring(0, 100) + '...');
 
-    // Increment usage counter (async, don't wait for response)
+    // Extract only RECEIVED messages
+    const startMarker = 'RECEIVED_MESSAGES_START';
+    const endMarker = 'RECEIVED_MESSAGES_END';
+
+    const startIndex = responseContent.indexOf(startMarker);
+    const endIndex = responseContent.indexOf(endMarker);
+
+    let extractedText;
+
+    if (startIndex !== -1 && endIndex !== -1) {
+      const messagesSection = responseContent.substring(
+        startIndex + startMarker.length, 
+        endIndex
+      ).trim();
+      
+      extractedText = messagesSection;
+    } else {
+      // Fallback - use entire response
+      extractedText = responseContent;
+    }
+
+    // Robust validation
+    const isValid = extractedText && 
+                    extractedText.length > 5 && 
+                    !extractedText.toLowerCase().includes('no text') &&
+                    !extractedText.toLowerCase().includes('cannot') &&
+                    !extractedText.toLowerCase().includes('unable') &&
+                    !extractedText.toLowerCase().includes('error');
+
+    if (!isValid) {
+      return res.status(400).json({ 
+        error: 'No messages found',
+        message: 'Could not find any text messages in this image. Please upload a clear screenshot of a conversation.'
+      });
+    }
+
+    console.log('✅ Extracted messages:', extractedText.substring(0, 100) + '...');
+
+    // Cache the result
+    analysisCache.set(cacheKey, {
+      text: extractedText,
+      timestamp: Date.now()
+    });
+
+    // Clean up old cache entries (keep cache size manageable)
+    if (analysisCache.size > 100) {
+      const oldestKey = analysisCache.keys().next().value;
+      analysisCache.delete(oldestKey);
+    }
+
+    // Increment usage counter (async, don't wait)
     incrementUsage(req.userId).catch(err => 
       console.error('Usage increment error:', err)
     );
 
-    // Return extracted text in format frontend expects
+    // Return extracted text
     res.json({
       ParsedResults: [{
         ParsedText: extractedText
@@ -185,15 +415,14 @@ app.post('/api/ocr', authenticateUser, upload.single('image'), async (req, res) 
   } catch (error) {
     console.error('❌ OCR error:', error);
     res.status(500).json({ 
-      error: 'Failed to process image',
-      details: error.message 
+      error: 'Processing failed',
+      message: 'An error occurred while processing your image. Please try again.'
     });
   }
 });
 
 // ============================================
-// MESSAGE EXTRACTION ENDPOINT
-// Separates sender messages from receiver messages
+// MESSAGE EXTRACTION ENDPOINT (LEGACY - KEPT FOR COMPATIBILITY)
 // ============================================
 
 app.post('/api/extract', async (req, res) => {
@@ -201,65 +430,33 @@ app.post('/api/extract', async (req, res) => {
     const { rawText } = req.body;
 
     if (!rawText) {
-      return res.status(400).json({ error: 'No text provided' });
+      return res.status(400).json({ 
+        error: 'No text provided',
+        message: 'Please provide text to extract'
+      });
     }
 
-    console.log('🔍 Extracting messages from text...');
-
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        messages: [
-          {
-            role: 'system',
-            content: `You are an expert at analyzing OCR-extracted text from chat conversations. Extract ONLY the messages sent TO the phone owner.
-
-SENDER MESSAGES (Extract these):
-- Longer messages, questions, conversation starters
-- Patterns: "Hey", "How are you", "Are you", "Can you", "I was thinking"
-- Examples: "Hey how are you doing?", "Are you free this weekend?"
-
-RECEIVER MESSAGES (Ignore these):
-- Short responses: "Good", "Yes", "No", "Ok", "Thanks", "Lol"
-- Examples: "Good thanks", "Yeah sure", "Ok"
-
-SYSTEM TEXT (Remove completely):
-- Timestamps, contact names, "Delivered", "Read", "Typing"
-
-OUTPUT FORMAT:
-EXTRACTED_MESSAGES_START
-[Clean sender message 1]
-[Clean sender message 2]
-EXTRACTED_MESSAGES_END`
-          },
-          {
-            role: 'user',
-            content: `Extract sender messages from: ${rawText}`
-          }
-        ],
-        temperature: 0,
-        max_tokens: 2000
-      }),
+    // Simple extraction - just pass through
+    // Vision API already did the extraction
+    res.json({
+      choices: [{
+        message: {
+          content: `EXTRACTED_MESSAGES_START\n${rawText}\nEXTRACTED_MESSAGES_END`
+        }
+      }]
     });
-
-    const data = await response.json();
-    console.log('✅ Messages extracted successfully');
-    res.json(data);
 
   } catch (error) {
     console.error('❌ Extraction Error:', error);
-    res.status(500).json({ error: 'Message extraction failed' });
+    res.status(500).json({ 
+      error: 'Extraction failed',
+      message: 'Failed to extract messages'
+    });
   }
 });
 
 // ============================================
 // ANALYSIS ENDPOINT - Psychological Analysis
-// NEW FORMAT: Short intent + First-person reply
 // ============================================
 
 app.post('/api/analyze', async (req, res) => {
@@ -267,10 +464,20 @@ app.post('/api/analyze', async (req, res) => {
     const { messages } = req.body;
 
     if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({ error: 'No messages provided' });
+      return res.status(400).json({ 
+        error: 'Invalid input',
+        message: 'Please provide messages to analyze'
+      });
     }
 
-    console.log('🧠 Analyzing messages with psychological prompts...');
+    if (messages.length === 0) {
+      return res.status(400).json({ 
+        error: 'No messages',
+        message: 'No messages found to analyze'
+      });
+    }
+
+    console.log('🧠 Analyzing', messages.length, 'messages...');
 
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -283,88 +490,109 @@ app.post('/api/analyze', async (req, res) => {
         messages: [
           {
             role: 'system',
-            content: `You are a brutal psychological analyst decoding text conversations.
-
-Analyze ONLY the messages the user RECEIVED (not their own messages).
-
-Your job:
-1. Identify the REAL hidden intent using psychological terms
-2. Provide a SHORT insightful summary (MAX 7 WORDS)
-3. Create a FIRST-PERSON reply the user can copy and send directly
+            content: `You analyze text conversations and expose manipulation tactics with brutal honesty.
 
 CRITICAL RULES:
-- Hidden intent format: "psychological term → max 7 word summary"
-- Strategic reply MUST be first-person ("I" statements), ready to paste and send
-- Reply should manipulate, gain power, and get on their nerves
-- Reply must sound natural, like the user wrote it themselves
-- NO third-person advice, NO explanations, just the actual message to send
+- Use SIMPLE, everyday language (no academic jargon)
+- Strategic reply must DIRECTLY respond to what they said
+- Reply should feel like a natural next message in the conversation
+- Reply should catch them off guard by exposing their game
+- Reply should flow naturally but hit hard
+- Analyze ALL messages TOGETHER as ONE conversation
+- Give ONE strategic reply that addresses the entire conversation
 
-Examples:
+ANALYSIS STYLE:
+❌ BAD: "Narcissistic supply-seeking behavior manifesting through excessive positive reinforcement"
+✅ GOOD: "Fishing for compliments and validation"
 
-Message: "Hey are you free tonight?"
-**Hidden Intent:** 
-Availability testing → Fishing for your attention and priority
+REPLY STYLE:
+The reply must:
+1. Make sense as the next message in the conversation
+2. Reference something they actually said
+3. Catch them off guard by seeing through their bullshit
+4. Sound casual/natural, not scripted
+5. Be brutal but conversational
 
-**Behavior Type:**
-Attention-Seeking
+FORMAT:
 
-**Strategic Reply:**
-Depends what you're offering. I've got options tonight.
-
-────────────────
-
-Message: "Just checking in on you 😊"
 **Hidden Intent:**
-Control disguised as care → Monitoring your availability
+[Simple description] → [What they're really doing in plain English]
 
 **Behavior Type:**
-Controlling
+[ONE LABEL]
 
 **Strategic Reply:**
-I'm good. Been busy actually. What's up?
+[Natural response that flows from the conversation but exposes their game]
 
-────────────────
+KEY PRINCIPLES FOR STRATEGIC REPLY:
+1. **Reference what they actually said** - "You always do X when Y"
+2. **Point out their pattern** - "Every time you... you always..."
+3. **Ask what they really want** - "What do you actually want?" / "What's this really about?"
+4. **Use casual language** - lol, haha, ... (makes it less aggressive)
+5. **Catch them off guard** - They don't expect you to see through it
+6. **Stay conversational** - Should sound like something a friend would text
 
-Message: "We should catch up soon!"
-**Hidden Intent:**
-Vague obligation creation → Building social debt without commitment
+GOOD REPLIES (Do this):
+✅ "You're being extra sweet today, what do you need? 😂"
+✅ "Cool story about the water bottle lol, what's actually going on?"
+✅ "You only hit me up with this energy when you want something, what is it this time?"
 
-**Behavior Type:**
-Manipulative  
-
-**Strategic Reply:**
-Sure, let me know when you've got specific plans.
-
-────────────────
-
-FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
-
-**Hidden Intent:** 
-[Psychological term] → [max 7 word insightful summary]
-
-**Behavior Type:**
-[One-word category]
-
-**Strategic Reply:**
-[First-person message ready to copy and send. Must sound natural and conversational. Use "I" statements. This is what the USER will send, not advice about what to send.]`
+Remember: Output ONLY the three sections (Hidden Intent, Behavior Type, Strategic Reply). Nothing else. No explanations or meta-commentary.`
           },
           {
             role: 'user',
-            content: `Analyze these messages: ${messages.join('\n\n')}`
+            content: `Analyze this conversation I received and give me a reply that FLOWS naturally but calls them out:
+
+${messages.map((msg, i) => `${i + 1}. "${msg}"`).join('\n')}
+
+Make the reply sound natural and reference what they actually said.`
           }
         ],
-        temperature: 0.9
+        temperature: 0.8,
+        max_tokens: 250
       }),
     });
 
+    if (!response.ok) {
+      const errorData = await response.json();
+      console.error('OpenAI analysis error:', errorData);
+      return res.status(500).json({ 
+        error: 'Analysis failed',
+        message: 'Failed to analyze messages. Please try again.'
+      });
+    }
+
     const data = await response.json();
+    
+    if (!data.choices?.[0]?.message?.content) {
+      return res.status(500).json({ 
+        error: 'No analysis result',
+        message: 'Failed to generate analysis'
+      });
+    }
+
     console.log('✅ Analysis complete');
     res.json(data);
 
   } catch (error) {
     console.error('❌ Analysis Error:', error);
-    res.status(500).json({ error: 'Analysis failed' });
+    res.status(500).json({ 
+      error: 'Analysis failed',
+      message: 'An error occurred during analysis. Please try again.'
+    });
   }
+});
+
+// ============================================
+// ERROR HANDLER
+// ============================================
+
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({
+    error: 'Server error',
+    message: 'An unexpected error occurred. Please try again.'
+  });
 });
 
 // ============================================
@@ -372,12 +600,11 @@ FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
 // ============================================
 
 if (process.env.NODE_ENV === 'production') {
-  // For Vercel deployment
   module.exports = app;
 } else {
-  // For local development
   app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
     console.log(`🔍 Local: http://localhost:${PORT}`);
+    console.log(`📊 Rate limit: ${RATE_LIMIT_MAX} requests per hour`);
   });
 }
