@@ -29,6 +29,7 @@ app.use(express.json({ limit: '50mb' }));
 const signupHandler = require('./api/auth/signup');
 const loginHandler = require('./api/auth/login');
 const logoutHandler = require('./api/auth/logout');
+const checkUserHandler = require('./api/auth/check-user');
 const { authenticateUser } = require('./middleware/auth');
 const { isUserSubscribed, incrementUsage, saveAnalysis, getUserSubscription, hasReachedUsageLimit, getUserUsage } = require('./lib/supabase');
 
@@ -100,6 +101,7 @@ app.get('/api', (req, res) => {
 app.post('/api/auth/signup', signupHandler);
 app.post('/api/auth/login', loginHandler);
 app.post('/api/auth/logout', logoutHandler);
+app.get('/api/auth/check-user', checkUserHandler);
 
 // ============================================
 // SUBSCRIPTION MANAGEMENT ENDPOINTS
