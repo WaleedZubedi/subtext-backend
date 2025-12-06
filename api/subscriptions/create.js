@@ -74,10 +74,18 @@ module.exports = async (req, res) => {
         });
         console.log('✅ Subscription saved:', subscription);
       } catch (dbError) {
-        console.error('❌ Database error:', dbError);
+        console.error('❌ Database error:', {
+          error: dbError,
+          message: dbError.message,
+          code: dbError.code,
+          details: dbError.details,
+          hint: dbError.hint
+        });
         return res.status(500).json({
           error: 'Database error',
-          message: 'Failed to save subscription. Please contact support.'
+          message: dbError.message || 'Failed to save subscription. Please contact support.',
+          details: dbError.details,
+          hint: dbError.hint
         });
       }
 
