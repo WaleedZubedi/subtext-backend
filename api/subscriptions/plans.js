@@ -1,6 +1,13 @@
 // Get available subscription plans
 const { SUBSCRIPTION_PLANS } = require('../../lib/paypal');
 
+// PayPal plan ID mapping
+const PAYPAL_PLAN_IDS = {
+  basic: process.env.PAYPAL_BASIC_PLAN_ID,
+  pro: process.env.PAYPAL_PRO_PLAN_ID,
+  premium: process.env.PAYPAL_PREMIUM_PLAN_ID
+};
+
 module.exports = async (req, res) => {
   try {
     // Return plan information for frontend display
@@ -10,7 +17,8 @@ module.exports = async (req, res) => {
       price: SUBSCRIPTION_PLANS[tier].price,
       limit: SUBSCRIPTION_PLANS[tier].limit,
       description: SUBSCRIPTION_PLANS[tier].description,
-      features: getFeaturesByTier(tier)
+      features: getFeaturesByTier(tier),
+      paypalPlanId: PAYPAL_PLAN_IDS[tier] // Include PayPal plan ID for frontend
     }));
 
     res.json({
