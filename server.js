@@ -30,6 +30,7 @@ const signupHandler = require('./api/auth/signup');
 const loginHandler = require('./api/auth/login');
 const logoutHandler = require('./api/auth/logout');
 const checkUserHandler = require('./api/auth/check-user');
+const refreshTokenHandler = require('./api/auth/refresh');
 const { authenticateUser } = require('./middleware/auth');
 const { isUserSubscribed, incrementUsage, saveAnalysis, getUserSubscription, hasReachedUsageLimit, getUserUsage } = require('./lib/supabase');
 
@@ -101,6 +102,7 @@ app.get('/api', (req, res) => {
 app.post('/api/auth/signup', signupHandler);
 app.post('/api/auth/login', loginHandler);
 app.post('/api/auth/logout', logoutHandler);
+app.post('/api/auth/refresh', refreshTokenHandler);
 app.get('/api/auth/check-user', checkUserHandler);
 
 // ============================================
@@ -338,9 +340,10 @@ ERROR: This image does not contain text messages`
     }
 
     const responseContent = visionData.choices[0].message.content.trim();
-    console.log('=== VISION RESPONSE ===');
-    console.log(responseContent);
-    console.log('=======================');
+    console.log('=== VISION API RESPONSE ===');
+    console.log('Length:', responseContent.length);
+    console.log('Content:', responseContent);
+    console.log('===========================');
 
     // Check if image doesn't contain messages
     if (responseContent.includes('ERROR:') || 
@@ -363,26 +366,30 @@ ERROR: This image does not contain text messages`
 
     if (startIndex !== -1 && endIndex !== -1) {
       const messagesSection = responseContent.substring(
-        startIndex + startMarker.length, 
+        startIndex + startMarker.length,
         endIndex
       ).trim();
-      
+
       extractedText = messagesSection;
+      console.log('✅ Found marked section:', extractedText.substring(0, 100) + '...');
     } else {
       // Fallback - use entire response
+      console.log('⚠️ No markers found, using entire response');
       extractedText = responseContent;
     }
 
-    // Robust validation
-    const isValid = extractedText && 
-                    extractedText.length > 5 && 
-                    !extractedText.toLowerCase().includes('no text') &&
-                    !extractedText.toLowerCase().includes('cannot') &&
-                    !extractedText.toLowerCase().includes('unable') &&
-                    !extractedText.toLowerCase().includes('error');
+    // Robust validation - check if we got actual text content
+    const hasContent = extractedText && extractedText.trim().length > 0;
+    const isErrorMessage = extractedText && (
+      extractedText.toLowerCase().includes('no text messages') ||
+      extractedText.toLowerCase().includes('cannot identify') ||
+      extractedText.toLowerCase().includes('unable to') ||
+      extractedText.toLowerCase().startsWith('error')
+    );
 
-    if (!isValid) {
-      return res.status(400).json({ 
+    if (!hasContent || isErrorMessage) {
+      console.log('❌ Validation failed:', { hasContent, isErrorMessage, extractedText: extractedText?.substring(0, 50) });
+      return res.status(400).json({
         error: 'No messages found',
         message: 'Could not find any text messages in this image. Please upload a clear screenshot of a conversation.'
       });
